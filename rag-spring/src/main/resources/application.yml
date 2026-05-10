@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: rag-spring
+
+rag:
+  base-url: http://127.0.0.1:8000
+  api-key: dev-secret-key

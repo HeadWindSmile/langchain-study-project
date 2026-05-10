@@ -1,0 +1,16 @@
+### 直接测试 Python FastAPI
+POST http://127.0.0.1:8000/ask
+Content-Type: application/json
+X-API-Key: dev-secret-key
+
+{
+  "question": "RAG 的核心流程是什么？"
+}
+
+### 测试 Java Spring 转发
+POST http://127.0.0.1:8080/api/chat
+Content-Type: application/json
+
+{
+  "question": "RAG 的核心流程是什么？"
+}
