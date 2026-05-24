@@ -14,3 +14,21 @@ Content-Type: application/json
 {
   "question": "RAG 的核心流程是什么？"
 }
+
+### 直接测试 Python FastAPI ask-agent
+POST http://127.0.0.1:8000/ask-agent
+Content-Type: application/json
+X-API-Key: dev-secret-key
+
+{
+  "question": "RAG 的核心流程是什么？"
+}
+
+### 直接测试 Python FastAPI ask-agent 不调用tool工具
+POST http://127.0.0.1:8000/ask-agent
+Content-Type: application/json
+X-API-Key: dev-secret-key
+
+{
+  "question": "你好，你能做什么？"
+}

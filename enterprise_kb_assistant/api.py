@@ -15,66 +15,61 @@ from src.document_loader import load_documents_from_dir
 from src.exceptions import AppException
 from src.index_builder import build_retriever
 from src.rag_service import RagService
+from src.rag_agent_service import RagAgentService
 
-# ==========================================
-# 1. 基础配置与全局变量
-# ==========================================
 
-# 配置 Python 标准日志库，输出时间、日志级别和具体信息
+# 配置全局日志格式，后续中间件、异常处理和业务接口都会用同一个 logger 输出链路日志。
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
-# 全局 RAG 服务实例，在服务启动时初始化，常驻内存
+# 这两个服务会在 FastAPI 启动阶段初始化，并在进程生命周期内复用。
+# rag_service：传统 RAG，固定“检索 -> 生成”的流程。
+# rag_agent_service：Agentic RAG，由大模型判断是否调用检索工具。
 rag_service: RagService | None = None
+rag_agent_service: RagAgentService | None = None
 
-
-# ==========================================
-# 2. 统一响应体构建工具 (类似 Java 的 Result<T>)
-# ==========================================
 
 def success_response(data: Any, request_id: str) -> dict:
-    """构建标准化的成功响应 JSON 结构"""
+    """构造统一成功响应，保持所有接口返回结构一致。"""
     return {
-        "code": 0,  # 业务状态码 0 代表成功
+        "code": 0,
         "message": "success",
-        "data": data,  # 实际的业务数据载荷
-        "request_id": request_id,  # 链路追踪 ID，方便查日志
-    }
-
-
-def error_response(code: int, message: str, request_id: str) -> dict:
-    """构建标准化的错误响应 JSON 结构"""
-    return {
-        "code": code,  # 非 0 的业务错误码
-        "message": message,  # 给前端展示的错误提示
-        "data": None,  # 错误时通常无业务数据
+        "data": data,
         "request_id": request_id,
     }
 
 
-# ==========================================
-# 3. 生命周期管理 (应用启动/关闭时的回调)
-# ==========================================
+def error_response(code: int, message: str, request_id: str) -> dict:
+    """构造统一错误响应，异常处理器会统一调用它。"""
+    return {
+        "code": code,
+        "message": message,
+        "data": None,
+        "request_id": request_id,
+    }
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """FastAPI 生命周期钩子。
+
+    yield 之前：应用启动时执行，用来加载配置、读取文档、构建向量检索器和服务对象。
+    yield 之后：应用关闭时执行，可以放资源释放逻辑。
     """
-    FastAPI 生命周期管理器。
-    yield 之前的代码在服务启动前执行（负责加载文档、建立向量索引）。
-    yield 之后的代码在服务关闭时执行（负责资源释放）。
-    """
-    global rag_service
+    global rag_service, rag_agent_service
 
     logger.info("正在初始化 RAG 服务...")
 
-    # 加载配置和本地文档
+    # 读取 .env / 环境变量中的模型配置、向量库配置等。
     settings = load_settings()
+    # 从本地 data/docs 目录加载企业知识库文档。
     docs = load_documents_from_dir("data/docs")
 
-    # 构建基于 Chroma 的向量检索器 (耗时操作)
+    # 构建检索器：内部会进行文档切分、向量化，并连接或创建 Chroma 向量库。
     retriever = build_retriever(
         docs=docs,
         settings=settings,
@@ -84,82 +79,88 @@ async def lifespan(app: FastAPI):
         force_rebuild=False,
     )
 
-    # 注入检索器和配置，实例化问答服务
+    # 两种问答服务共用同一个 retriever，避免重复构建索引和重复占用资源。
     rag_service = RagService(retriever, settings)
+    rag_agent_service = RagAgentService(retriever, settings)
+
     logger.info("RAG 服务初始化完成。")
 
-    yield  # 服务器在此处挂起，开始监听外部 HTTP 请求
+    # yield 之后 FastAPI 才开始正常接收请求。
+    yield
 
     logger.info("RAG 服务关闭。")
 
 
-# ==========================================
-# 4. FastAPI 实例初始化
-# ==========================================
-
+# 创建 FastAPI 应用，并把 lifespan 绑定进去，让启动时自动初始化 RAG 服务。
 app = FastAPI(
     title="Enterprise Knowledge Base Assistant",
     description="基于 LangChain + Chroma 的企业知识库问答服务",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 
-# ==========================================
-# 5. 全局中间件 (Middleware)
-# ==========================================
-
 @app.middleware("http")
 async def add_request_id_and_log(request: Request, call_next):
+    """统一请求中间件。
+
+    每个 HTTP 请求都会先进入这里：生成 request_id、记录开始日志、调用实际路由、
+    记录结束日志，并把 request_id 放到响应头，方便前端和后端日志对齐排查。
     """
-    HTTP 拦截器：所有请求进出都会经过这里。
-    职责：生成请求唯一 ID (Trace ID)，记录请求出入参，统计耗时。
-    """
-    # 1. 为每次请求生成 UUID，并挂载到 request.state 上，方便后续环节提取
+    # 给每个请求生成唯一 ID，并挂到 request.state，后续路由和异常处理器都能读取。
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
 
     start_time = time.time()
+
+    # 请求进入时记录方法和路径。
     logger.info(
         "request_start request_id=%s method=%s path=%s",
-        request_id, request.method, request.url.path,
+        request_id,
+        request.method,
+        request.url.path,
     )
 
     try:
-        # 2. 放行请求，将控制权交给具体的路由函数 (或抛出异常给下游 handler)
+        # 放行到下一个中间件或真正的路由函数。
         response = await call_next(request)
     except Exception:
-        # 如果路由内部发生严重错误（且未被 exception_handler 捕获），记录异常并向上抛出
+        # 如果请求处理过程中抛出异常，这里记录耗时和堆栈，然后继续交给异常处理器。
         elapsed = time.time() - start_time
         logger.exception(
             "request_error request_id=%s elapsed=%.3fs",
-            request_id, elapsed,
+            request_id,
+            elapsed,
         )
         raise
 
-    # 3. 记录请求处理完成的耗时和状态码
     elapsed = time.time() - start_time
+
+    # 请求结束时记录状态码和总耗时。
     logger.info(
         "request_end request_id=%s status_code=%s elapsed=%.3fs",
-        request_id, response.status_code, elapsed,
+        request_id,
+        response.status_code,
+        elapsed,
     )
 
-    # 4. 将 Request ID 塞进 HTTP 响应头中，方便前端排查问题
+    # 把 request_id 返回给调用方，调用方可以用它快速定位服务端日志。
     response.headers["X-Request-ID"] = request_id
     return response
 
 
-# ==========================================
-# 6. 全局异常处理 (Exception Handlers)
-# ==========================================
-
 @app.exception_handler(AppException)
 async def app_exception_handler(request: Request, exc: AppException):
-    """捕获自定义的业务异常 (如：余额不足、无权限等)"""
+    """处理项目自定义业务异常，例如服务未初始化等可预期错误。"""
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    logger.warning("app_exception request_id=%s code=%s message=%s", request_id, exc.code, exc.message)
 
-    # 统一转换为 HTTP 400，并返回我们定义的标准错误 JSON
+    logger.warning(
+        "app_exception request_id=%s code=%s message=%s",
+        request_id,
+        exc.code,
+        exc.message,
+    )
+
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content=error_response(exc.code, exc.message, request_id),
@@ -168,9 +169,15 @@ async def app_exception_handler(request: Request, exc: AppException):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    """捕获 FastAPI 原生的 HTTP 异常 (如我们写在鉴权依赖里的 raise HTTPException)"""
+    """处理 FastAPI/Starlette 抛出的 HTTP 异常，例如鉴权失败。"""
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    logger.warning("http_exception request_id=%s status_code=%s detail=%s", request_id, exc.status_code, exc.detail)
+
+    logger.warning(
+        "http_exception request_id=%s status_code=%s detail=%s",
+        request_id,
+        exc.status_code,
+        exc.detail,
+    )
 
     return JSONResponse(
         status_code=exc.status_code,
@@ -180,68 +187,92 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """捕获 Pydantic 数据校验异常 (例如前端漏传了 question 字段)"""
+    """处理请求体或参数校验失败，例如缺少 question 字段。"""
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    logger.warning("validation_exception request_id=%s errors=%s", request_id, exc.errors())
 
-    # 转换为 422 状态码 (Unprocessable Entity)
+    logger.warning(
+        "validation_exception request_id=%s errors=%s",
+        request_id,
+        exc.errors(),
+    )
+
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content=error_response(422, "请求参数校验失败", request_id),
+        content=error_response(
+            422,
+            "请求参数校验失败",
+            request_id,
+        ),
     )
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """兜底拦截所有未预料到的系统异常 (防止堆栈信息泄露给前端)"""
+    """兜底异常处理，避免内部堆栈直接暴露给调用方。"""
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    logger.exception("unhandled_exception request_id=%s error=%s", request_id, str(exc))
+
+    logger.exception(
+        "unhandled_exception request_id=%s error=%s",
+        request_id,
+        str(exc),
+    )
 
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=error_response(500, "服务内部错误", request_id),
+        content=error_response(
+            500,
+            "服务内部错误",
+            request_id,
+        ),
     )
 
 
-# ==========================================
-# 7. 业务路由接口 (Endpoints)
-# ==========================================
-
 @app.get("/health")
 def health_check(request: Request):
-    """探针接口：用于 K8s/Docker 等容器检查服务存活状态"""
+    """健康检查接口，通常给容器、负载均衡或人工排查使用。"""
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     return success_response({"status": "ok"}, request_id)
 
 
 @app.post(
     "/ask",
-    response_model=ApiResponse[AskData],  # 自动生成正确的 Swagger API 文档
-    dependencies=[Depends(verify_api_key)],  # 路由级别的依赖注入，先执行 API Key 校验逻辑
+    response_model=ApiResponse[AskData],
+    dependencies=[Depends(verify_api_key)],
 )
 def ask(request: Request, body: AskRequest):
-    """核心问答接口：接收前端提问，调用大模型生成答案并返回"""
-
-    # 从上下文中提取 Request ID，保证业务日志能和外部请求串联
+    """
+    classic RAG：
+    固定流程：先检索，再生成。
+    """
+    # 从中间件写入的 request.state 中取链路 ID，兜底情况下重新生成一个。
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
-    # 防御性编程：确保服务可用
+    # 启动初始化失败或尚未完成时，避免调用 None.answer 导致不可读的系统异常。
     if rag_service is None:
         raise AppException(code=50001, message="RAG 服务尚未初始化完成")
 
-    logger.info("ask_start request_id=%s question=%s", request_id, body.question)
+    logger.info(
+        "classic_rag_start request_id=%s question=%s",
+        request_id,
+        body.question,
+    )
+
     start_time = time.time()
 
-    # ---> 核心调用点：执行 LangChain 的检索和生成逻辑 <---
+    # 传统 RAG 的核心调用：服务内部会先检索知识库，再把上下文交给模型生成答案。
     result = rag_service.answer(body.question)
 
     elapsed = time.time() - start_time
+
     logger.info(
-        "ask_end request_id=%s elapsed=%.3fs sources_count=%s",
-        request_id, elapsed, len(result.get("sources", [])),
+        "classic_rag_end request_id=%s elapsed=%.3fs sources_count=%s",
+        request_id,
+        elapsed,
+        len(result.get("sources", [])),
     )
 
-    # 将底层返回的字典，映射到严格类型的 Pydantic 响应模型中
+    # 将底层 dict 转为 Pydantic 模型，再 dump 成统一响应里的 data 字段。
+    # 这样可以保证 sources 中的字段结构和 OpenAPI 文档一致。
     data = AskData(
         answer=result["answer"],
         sources=[
@@ -254,5 +285,59 @@ def ask(request: Request, body: AskRequest):
         ],
     )
 
-    # 返回最终的标准格式 JSON
+    # 最终返回统一响应结构：code/message/data/request_id。
+    return success_response(data.model_dump(), request_id)
+
+
+@app.post(
+    "/ask-agent",
+    response_model=ApiResponse[AskData],
+    dependencies=[Depends(verify_api_key)],
+)
+def ask_agent(request: Request, body: AskRequest):
+    """
+    agentic RAG：
+    由 Agent 判断是否需要调用知识库检索工具。
+    """
+    # 和 /ask 一样，所有业务日志都使用同一个 request_id 串起来。
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    # Agent 服务同样在应用启动时初始化，这里做防御性检查。
+    if rag_agent_service is None:
+        raise AppException(code=50002, message="RAG Agent 服务尚未初始化完成")
+
+    logger.info(
+        "agentic_rag_start request_id=%s question=%s",
+        request_id,
+        body.question,
+    )
+
+    start_time = time.time()
+
+    # Agentic RAG 的核心调用：Agent 会根据问题决定是否调用 retrieve_knowledge 工具。
+    result = rag_agent_service.answer(body.question)
+
+    elapsed = time.time() - start_time
+
+    logger.info(
+        "agentic_rag_end request_id=%s elapsed=%.3fs sources_count=%s",
+        request_id,
+        elapsed,
+        len(result.get("sources", [])),
+    )
+
+    # 将 Agent 服务返回的答案和引用来源转换成接口层响应模型。
+    data = AskData(
+        answer=result["answer"],
+        sources=[
+            SourceItem(
+                source=item.get("source"),
+                page=item.get("page"),
+                snippet=item.get("snippet", ""),
+            )
+            for item in result.get("sources", [])
+        ],
+    )
+
+    # 返回格式和 /ask 保持一致，前端可以用同一套解析逻辑处理两种 RAG。
     return success_response(data.model_dump(), request_id)
