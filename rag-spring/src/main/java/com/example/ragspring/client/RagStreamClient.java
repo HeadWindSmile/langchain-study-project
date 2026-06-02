@@ -14,11 +14,8 @@ public class RagStreamClient {
 
     private final WebClient webClient;
 
-    public RagStreamClient() {
-        this.webClient = WebClient.builder()
-                .baseUrl("http://127.0.0.1:8000")
-                .defaultHeader("X-API-Key", "dev-secret-key")
-                .build();
+    public RagStreamClient(WebClient ragWebClient) {
+        this.webClient = ragWebClient;
     }
 
     public Flux<ServerSentEvent<String>> streamAsk(String question) {

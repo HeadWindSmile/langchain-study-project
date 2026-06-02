@@ -5,6 +5,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
 @EnableConfigurationProperties(RagProperties.class)
@@ -15,6 +16,14 @@ public class RagClientConfig {
         System.out.println("Python RAG baseUrl = " + properties.baseUrl());
         return RestClient.builder()
                 .requestFactory(new SimpleClientHttpRequestFactory())
+                .baseUrl(properties.baseUrl())
+                .defaultHeader("X-API-Key", properties.apiKey())
+                .build();
+    }
+
+    @Bean
+    public WebClient ragWebClient(RagProperties properties) {
+        return WebClient.builder()
                 .baseUrl(properties.baseUrl())
                 .defaultHeader("X-API-Key", properties.apiKey())
                 .build();
