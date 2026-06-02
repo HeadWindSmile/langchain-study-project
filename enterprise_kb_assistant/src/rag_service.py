@@ -1,4 +1,5 @@
-# 负责检索和生成答案
+import json
+from typing import Iterator
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -27,16 +28,14 @@ class RagService:
             ),
             (
                 "human",
-                "问题：{question}\n\n"
-                "上下文：\n{context}"
-            )
+                "问题：{question}\n\n上下文：\n{context}"
+            ),
         ])
 
         self.chain = self.prompt | self.model
 
     def answer(self, question: str) -> dict:
         retrieved_docs = self.retriever.invoke(question)
-
         context = self._format_context(retrieved_docs)
 
         response = self.chain.invoke({
@@ -48,6 +47,36 @@ class RagService:
             "answer": response.content,
             "sources": self._format_sources(retrieved_docs),
         }
+
+    def stream_answer(self, question: str) -> Iterator[str]:
+        """
+        流式回答。
+
+        SSE 事件顺序：
+        1. sources：先返回检索来源
+        2. token：逐步返回模型生成内容
+        3. done：生成结束
+        4. error：异常
+        """
+        try:
+            retrieved_docs = self.retriever.invoke(question)
+            context = self._format_context(retrieved_docs)
+            sources = self._format_sources(retrieved_docs)
+
+            yield self._sse_event("sources", {"sources": sources})
+
+            for chunk in self.chain.stream({
+                "question": question,
+                "context": context,
+            }):
+                content = getattr(chunk, "content", None)
+                if content:
+                    yield self._sse_event("token", {"content": content})
+
+            yield self._sse_event("done", {"message": "completed"})
+
+        except Exception as e:
+            yield self._sse_event("error", {"message": str(e)})
 
     @staticmethod
     def _format_context(docs) -> str:
@@ -69,3 +98,8 @@ class RagService:
             }
             for doc in docs
         ]
+
+    @staticmethod
+    def _sse_event(event: str, data: dict) -> str:
+        json_data = json.dumps(data, ensure_ascii=False)
+        return f"event: {event}\ndata: {json_data}\n\n"

@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.api_models import ApiResponse, AskData, AskRequest, SourceItem
 from src.auth import verify_api_key
@@ -341,3 +341,57 @@ def ask_agent(request: Request, body: AskRequest):
 
     # 返回格式和 /ask 保持一致，前端可以用同一套解析逻辑处理两种 RAG。
     return success_response(data.model_dump(), request_id)
+
+
+
+@app.post(
+    "/ask/stream",
+    dependencies=[Depends(verify_api_key)],
+)
+def ask_stream(request: Request, body: AskRequest):
+    """
+    classic RAG 流式接口：
+    固定流程：先检索，再流式生成。
+    """
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+
+    if rag_service is None:
+        raise AppException(code=50001, message="RAG 服务尚未初始化完成")
+
+    logger.info(
+        "classic_rag_stream_start request_id=%s question=%s",
+        request_id,
+        body.question,
+    )
+
+    def event_generator():
+        start_time = time.time()
+
+        try:
+            for event in rag_service.stream_answer(body.question):
+                yield event
+
+            elapsed = time.time() - start_time
+
+            logger.info(
+                "classic_rag_stream_end request_id=%s elapsed=%.3fs",
+                request_id,
+                elapsed,
+            )
+
+        except Exception as e:
+            logger.exception(
+                "classic_rag_stream_error request_id=%s error=%s",
+                request_id,
+                str(e),
+            )
+            yield f"event: error\ndata: {{\"message\":\"服务内部错误\"}}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Request-ID": request_id,
+        },
+    )
